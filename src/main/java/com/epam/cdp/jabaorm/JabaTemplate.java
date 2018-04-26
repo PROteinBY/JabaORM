@@ -2,12 +2,16 @@ package com.epam.cdp.jabaorm;
 
 import com.epam.cdp.jabaorm.annotations.JabaColumn;
 import com.epam.cdp.jabaorm.annotations.JabaEntity;
+import com.sun.rowset.JdbcRowSetImpl;
 import javafx.util.Pair;
 import org.apache.commons.text.StringSubstitutor;
 
+import javax.sql.rowset.JdbcRowSet;
 import java.lang.reflect.Field;
+import java.sql.*;
 import java.text.SimpleDateFormat;
 import java.util.*;
+import java.util.Date;
 import java.util.stream.Collectors;
 
 /**
@@ -28,14 +32,16 @@ public class JabaTemplate<T> {
     private String targetTableName;
     private Map<String, String> columnMappings;
     private Class<T> targetClass;
+    private Connection dbConnection;
 
     private String insertTemplate;
     private String updateTemplate;
     private String deleteTemplate;
     private String selectTemplate;
 
-    public static <E> JabaTemplate<E> create(Class<E> targetClass) {
-        JabaTemplate<E> template = new JabaTemplate<>(targetClass);
+    // Prepare template for target class. Scan fields and types, create mappings and templates.
+    public static <E> JabaTemplate<E> create(Class<E> targetClass, Connection connection) throws Exception {
+        JabaTemplate<E> template = new JabaTemplate<>(targetClass, connection);
 
         JabaEntity entityMark = targetClass.getDeclaredAnnotation(JabaEntity.class);
 
@@ -91,31 +97,79 @@ public class JabaTemplate<T> {
                         template.targetTableName +
                         " WHERE ${conditions};";
 
+        template.updateTemplate =
+                "UPDATE " + template.targetTableName +
+                        " SET ${updatedValues} WHERE ${conditions};";
+
+        template.deleteTemplate =
+                "DELETE FROM " + template.targetTableName +
+                        " WHERE ${conditions};";
+
 
         return template;
     }
 
-    private JabaTemplate(Class<T> targetClass) {
+    private JabaTemplate(Class<T> targetClass, Connection connection) throws SQLException {
         this.targetClass = targetClass;
+        this.dbConnection = connection;
     }
 
+    /**
+     * Return the first object that match the criteria
+     *
+     * @param searchObject object with criteria (null to ignore field)
+     * @return first object that match the criteria
+     * @throws Exception any errors
+     */
     public T search(T searchObject) throws Exception {
         String selectQuery = getSelectQuery(searchObject);
-        System.out.println(selectQuery);
-        return null;
+
+        JdbcRowSet rowSet = new JdbcRowSetImpl(dbConnection);
+        rowSet.setType(ResultSet.TYPE_SCROLL_INSENSITIVE);
+
+        rowSet.setCommand(selectQuery);
+        rowSet.execute();
+
+        if (!rowSet.next()) {
+            return null;
+        }
+
+        Object object = targetClass.newInstance();
+
+        for (String fieldName : columnMappings.keySet()) {
+            Field field = object.getClass().getDeclaredField(fieldName);
+
+            field.setAccessible(true);
+            field.set(object, rowSet.getObject(columnMappings.get(fieldName)));
+        }
+
+        return targetClass.cast(object);
     }
 
-    public T save(T object) throws Exception {
-        String insertString = getInsertQuery(object);
-        System.out.println(insertString);
-        return null;
+    // Just save object as a new row
+    public void save(T object) throws Exception {
+        dbConnection
+                .prepareStatement(getInsertQuery(object))
+                .execute();
     }
 
-    public T update(T searchObject, T updatedObject) {
-        return null;
+    // Update object with set fields. Return number of updated rows.
+    public int update(T searchObject, T updatedObject) throws Exception {
+        return dbConnection
+                .prepareStatement(getUpdateQuery(searchObject, updatedObject))
+                .executeUpdate();
     }
 
-    public void delete(T searchObject) {
+    /**
+     * Delete all matched rows
+     * @param searchObject object with criteria
+     * @throws Exception any errors
+     */
+    public void delete(T searchObject) throws Exception {
+        String deleteQuery = getDeleteQuery(searchObject);
+
+        PreparedStatement statement = dbConnection.prepareStatement(deleteQuery);
+        statement.execute();
     }
 
     private String getInsertQuery(T object) throws Exception {
@@ -158,6 +212,47 @@ public class JabaTemplate<T> {
         return substitutor.replace(selectTemplate);
     }
 
+    private String getUpdateQuery(T searchObject, T updatedObject) throws Exception {
+        Map<String, String> gaps = new HashMap<>(2);
+        List<Pair<String, String>> fieldsNameValues = getFieldsNameValueList(searchObject);
+        List<Pair<String, String>> fieldsNameValuesForUpdatedObject = getFieldsNameValueList(updatedObject);
+
+        gaps.put("updatedValues", String.join(
+                ", ",
+                fieldsNameValuesForUpdatedObject
+                        .stream()
+                        .map(fv -> fv.getKey() + " = " + fv.getValue())
+                        .collect(Collectors.toList())
+        ));
+
+        gaps.put("conditions", String.join(
+                " AND ",
+                fieldsNameValues
+                        .stream()
+                        .map(fv -> fv.getKey() + " = " + fv.getValue())
+                        .collect(Collectors.toList())
+        ));
+
+        StringSubstitutor substitutor = new StringSubstitutor(gaps);
+        return substitutor.replace(updateTemplate);
+    }
+
+    private String getDeleteQuery(T searchObject) throws Exception {
+        Map<String, String> gaps = new HashMap<>(2);
+        List<Pair<String, String>> fieldsNameValues = getFieldsNameValueList(searchObject);
+
+        gaps.put("conditions", String.join(
+                " AND ",
+                fieldsNameValues
+                        .stream()
+                        .map(fv -> fv.getKey() + " = " + fv.getValue())
+                        .collect(Collectors.toList())
+        ));
+
+        StringSubstitutor substitutor = new StringSubstitutor(gaps);
+        return substitutor.replace(deleteTemplate);
+    }
+
     // Return list of fieldName -> fieldValue for sql
     private List<Pair<String, String>> getFieldsNameValueList(T object) throws Exception {
         List<Pair<String, String>> fieldsValuesList = new ArrayList<>();
@@ -183,15 +278,41 @@ public class JabaTemplate<T> {
      */
     private String getSqlFriendlyValueString(Object object) {
         if (object instanceof String) {
-            return "'" + object + "'";
+            return "'" + object.toString() + "'";
         }
 
         if (object instanceof Date) {
-            SimpleDateFormat sdf = new SimpleDateFormat("dd-MM-yyyy");
+            SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd");
             return "'" + sdf.format(object) + "'";
         }
 
         return object.toString();
+    }
+
+    /**
+     * Create Connection object
+     * @param driver JDBC driver
+     * @param connection url to connect
+     * @param user database user
+     * @param pass user's password
+     * @return Connection object
+     */
+    public static Connection getDbConnection(String driver, String connection, String user, String pass) {
+        Connection dbConnection = null;
+
+        try {
+            Class.forName(driver);
+        } catch (ClassNotFoundException e) {
+            System.out.println(e.getMessage());
+        }
+
+        try {
+            dbConnection = DriverManager.getConnection(connection, user, pass);
+        } catch (SQLException e) {
+            System.out.println(e.getMessage());
+        }
+
+        return dbConnection;
     }
 
     /**
